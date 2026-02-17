@@ -1,7 +1,7 @@
 # cf-worker-ai-js
 这是一个适用于Cloudflare worker的js代码，用于在worker上运行兼容openAI的LLM API
 
-注意:这个代码并不完美，目前建议使用非流式响应，在某些情况下流式可能会卡前端
+注意:这个代码并不完美，请帮助改善
 
 **1.使用方法**
 
