@@ -3,11 +3,11 @@
 
 注意:这个代码并不完美，目前建议使用非流式响应，在某些情况下流式可能会卡前端
 
-**使用方法**
+**1.使用方法**
 
 将`布署用这个.js`的内容复制下来，粘贴到你的Cloudflare worker里，然后布署
 
-**填写及绑定**
+**2.填写及绑定**
 
 `API_SECRET_KEY`：填写你的API tocken值，一定要记住
 
@@ -15,7 +15,7 @@
 
 绑定workers AI，名为`AI`
 
-**调用**
+**3.调用**
 
 API类型/提供商: OpenAI-Compatible （或 Generic OpenAI ，确保选择与 OpenAI API 格式兼容的选项）
 
