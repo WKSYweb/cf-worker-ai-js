@@ -1,96 +1,95 @@
-const DEFAULT_SETTINGS = {
-  model: "@cf/meta/llama-3-8b-instruct", // 默认模型
+const MODEL_MAPPING = {
+  "gpt oss 120b": "@cf/openai/gpt-oss-120b",
+  "llama4": "@cf/meta/llama-4-scout-17b-16e-instruct"
 };
 
 export default {
   async fetch(request, env) {
-    // 1. 处理 CORS 预检请求
-    if (request.method === "OPTIONS") {
-      return handleCors();
-    }
-
-    // 2. 身份验证
+    if (request.method === "OPTIONS") return handleCors();
     const authHeader = request.headers.get("Authorization");
-    const expectedAuth = `Bearer ${env.API_SECRET_KEY}`;
-    
-    if (!env.API_SECRET_KEY || authHeader !== expectedAuth) {
-      return new Response(JSON.stringify({
-        error: { message: "Invalid API Key", type: "invalid_request_error" }
-      }), { status: 401, headers: { "Content-Type": "application/json" } });
+    if (!env.API_SECRET_KEY || authHeader !== `Bearer ${env.API_SECRET_KEY}`) {
+      return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 });
     }
-
     const url = new URL(request.url);
-    
-    // 3. 路由匹配: /v1/chat/completions
     if (request.method === "POST" && url.pathname.endsWith("/v1/chat/completions")) {
       return await handleChat(request, env);
     }
-
     return new Response("Not Found", { status: 404 });
   },
 };
 
-/**
- * 处理聊天逻辑
- */
+// 核心：多维度提取文本，支持思维链 (Reasoning)
+function extractText(obj) {
+  if (!obj) return "";
+  if (typeof obj === 'string') return obj;
+
+  const choices = obj.choices?.[0];
+  const msg = choices?.message || choices?.delta || obj.message || obj.delta || {};
+  
+  // 按照优先级抓取：内容 > 推理内容 > 其他可能字段
+  return String(
+    msg.content || 
+    msg.reasoning_content || 
+    obj.response || 
+    obj.result || 
+    ""
+  );
+}
+
 async function handleChat(request, env) {
   try {
     const body = await request.json();
-    const {
-      messages,
-      model = env.DEFAULT_MODEL || DEFAULT_SETTINGS.model,
-      stream = false,
-      max_tokens = 2048,
-      temperature = 0.7
-    } = body;
-
-    // 调用 Cloudflare Workers AI
-    const aiResponse = await env.AI.run(model, {
-      messages,
-      stream,
-      max_tokens,
-      temperature
-    });
-
-    // 处理流式响应
-    if (stream) {
-      return makeStreamResponse(aiResponse, model);
+    let model = body.model || env.DEFAULT_MODEL || "@cf/meta/llama-3.1-8b-instruct";
+    
+    const lowerModel = model.toLowerCase().trim();
+    if (MODEL_MAPPING[lowerModel]) {
+      model = MODEL_MAPPING[lowerModel];
     }
 
-    // 处理非流式响应
+    const isStream = body.stream === true;
+    const requestId = `chatcmpl-${Math.random().toString(36).substring(2, 15)}`;
+    const createdTime = Math.floor(Date.now() / 1000);
+
+    // 调用 AI 引擎
+    const aiResponse = await env.AI.run(model, {
+      messages: body.messages,
+      stream: isStream,
+      // 120B 这种模型很话痨，建议把 max_tokens 稍微拉高一点
+      max_tokens: body.max_tokens || 4096, 
+    });
+
+    if (isStream) {
+      return makeStreamResponse(aiResponse, model, requestId, createdTime);
+    }
+
+    const result = await aiResponse;
+    let finalContent = extractText(result);
+
+    // 如果还是没抓到，给个提示
+    if (!finalContent) finalContent = "[Worker提示] 模型响应成功但内容字段缺失";
+
     return new Response(JSON.stringify({
-      id: `chatcmpl-${Date.now()}`,
+      id: String(requestId),
       object: "chat.completion",
-      created: Math.floor(Date.now() / 1000),
+      created: createdTime,
       model: model,
       choices: [{
         index: 0,
-        message: {
-          role: "assistant",
-          content: aiResponse.response,
-        },
-        finish_reason: "stop",
+        message: { role: "assistant", content: finalContent },
+        finish_reason: result.choices?.[0]?.finish_reason || "stop",
       }],
-      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-    }), {
-      headers: { 
-        "Content-Type": "application/json",
-        ...getCorsHeaders()
-      }
-    });
+      usage: result.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+    }), { headers: { "Content-Type": "application/json", ...getCorsHeaders() } });
 
   } catch (e) {
-    return new Response(JSON.stringify({ error: e.message }), { 
+    return new Response(JSON.stringify({ error: String(e.message) }), { 
       status: 500, 
-      headers: { "Content-Type": "application/json" } 
+      headers: { "Content-Type": "application/json", ...getCorsHeaders() } 
     });
   }
 }
 
-/**
- * 将 Cloudflare 的流格式转换为 OpenAI 兼容的 SSE 格式
- */
-function makeStreamResponse(aiStream, model) {
+function makeStreamResponse(aiStream, model, requestId, createdTime) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
@@ -107,29 +106,25 @@ function makeStreamResponse(aiStream, model) {
         }
 
         const chunk = decoder.decode(value);
-        // Cloudflare 的流返回的是类似 { response: "..." } 的 JSON 字符串
-        // 需要解析并包装
-        try {
-          const lines = chunk.split('\n').filter(line => line.trim());
-          for (let line of lines) {
-            if (line.startsWith('data:')) {
-              const data = JSON.parse(line.replace('data: ', ''));
+        const lines = chunk.split('\n').filter(l => l.startsWith('data: '));
+        
+        for (let line of lines) {
+          const jsonStr = line.replace('data: ', '').trim();
+          if (jsonStr === '[DONE]') continue;
+          try {
+            const parsed = JSON.parse(jsonStr);
+            const content = extractText(parsed);
+            if (content) {
               const payload = {
-                id: `chatcmpl-${Date.now()}`,
+                id: requestId,
                 object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
+                created: createdTime,
                 model: model,
-                choices: [{
-                  index: 0,
-                  delta: { content: data.response },
-                  finish_reason: null
-                }]
+                choices: [{ index: 0, delta: { content: content }, finish_reason: null }]
               };
               await writer.write(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
             }
-          }
-        } catch (e) {
-          console.error("Error parsing chunk", e);
+          } catch (e) {}
         }
       }
     } finally {
@@ -138,26 +133,18 @@ function makeStreamResponse(aiStream, model) {
   })();
 
   return new Response(readable, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
-      ...getCorsHeaders()
-    }
+    headers: { "Content-Type": "text/event-stream", ...getCorsHeaders() }
   });
 }
 
 function handleCors() {
-  return new Response(null, {
-    status: 204,
-    headers: getCorsHeaders()
-  });
+  return new Response(null, { status: 204, headers: getCorsHeaders() });
 }
 
 function getCorsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization",
   };
 }
