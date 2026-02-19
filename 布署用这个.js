@@ -3,44 +3,55 @@ const MODEL_MAPPING = {
   "llama4": "@cf/meta/llama-4-scout-17b-16e-instruct"
 };
 
+const DEFAULT_MODEL = "@cf/meta/llama-3.1-8b-instruct";
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return handleCors();
+
+    // 身份验证
     const authHeader = request.headers.get("Authorization");
     if (!env.API_SECRET_KEY || authHeader !== `Bearer ${env.API_SECRET_KEY}`) {
-      return new Response(JSON.stringify({ error: "Unauthorized" }), { status: 401 });
+      return new Response(JSON.stringify({ error: "Unauthorized" }), { 
+        status: 401, 
+        headers: { "Content-Type": "application/json" } 
+      });
     }
+
     const url = new URL(request.url);
     if (request.method === "POST" && url.pathname.endsWith("/v1/chat/completions")) {
       return await handleChat(request, env);
     }
+
     return new Response("Not Found", { status: 404 });
   },
 };
 
-// 核心：多维度提取文本，支持思维链 (Reasoning)
-function extractText(obj) {
+/**
+ * 核心：文本提取函数
+ * @param {Object} obj - 模型返回的 JSON 片段
+ * @param {Boolean} isStream - 是否为流式传输模式
+ */
+function extractText(obj, isStream = false) {
   if (!obj) return "";
-  if (typeof obj === 'string') return obj;
-
   const choices = obj.choices?.[0];
   const msg = choices?.message || choices?.delta || obj.message || obj.delta || {};
-  
-  // 按照优先级抓取：内容 > 推理内容 > 其他可能字段
-  return String(
-    msg.content || 
-    msg.reasoning_content || 
-    obj.response || 
-    obj.result || 
-    ""
-  );
+
+  // 如果是流式传输，只抓取真正的 content，忽略 reasoning_content
+  if (isStream) {
+    return String(msg.content || "");
+  }
+
+  // 如果是非流式，优先抓 content，如果没有再抓推理内容兜底
+  return String(msg.content || msg.reasoning_content || obj.response || obj.result || "");
 }
 
 async function handleChat(request, env) {
   try {
     const body = await request.json();
-    let model = body.model || env.DEFAULT_MODEL || "@cf/meta/llama-3.1-8b-instruct";
+    let model = body.model || env.DEFAULT_MODEL || DEFAULT_MODEL;
     
+    // 模型名称智能映射
     const lowerModel = model.toLowerCase().trim();
     if (MODEL_MAPPING[lowerModel]) {
       model = MODEL_MAPPING[lowerModel];
@@ -50,23 +61,20 @@ async function handleChat(request, env) {
     const requestId = `chatcmpl-${Math.random().toString(36).substring(2, 15)}`;
     const createdTime = Math.floor(Date.now() / 1000);
 
-    // 调用 AI 引擎
+    // 调用 Cloudflare AI
     const aiResponse = await env.AI.run(model, {
       messages: body.messages,
       stream: isStream,
-      // 120B 这种模型很话痨，建议把 max_tokens 稍微拉高一点
-      max_tokens: body.max_tokens || 4096, 
+      max_tokens: body.max_tokens || 4096, // 调高默认 Token 以防被掐断
     });
 
     if (isStream) {
       return makeStreamResponse(aiResponse, model, requestId, createdTime);
     }
 
+    // --- 非流式响应处理 ---
     const result = await aiResponse;
-    let finalContent = extractText(result);
-
-    // 如果还是没抓到，给个提示
-    if (!finalContent) finalContent = "[Worker提示] 模型响应成功但内容字段缺失";
+    const finalContent = extractText(result, false);
 
     return new Response(JSON.stringify({
       id: String(requestId),
@@ -82,13 +90,16 @@ async function handleChat(request, env) {
     }), { headers: { "Content-Type": "application/json", ...getCorsHeaders() } });
 
   } catch (e) {
-    return new Response(JSON.stringify({ error: String(e.message) }), { 
+    return new Response(JSON.stringify({ error: `Worker Error: ${e.message}` }), { 
       status: 500, 
       headers: { "Content-Type": "application/json", ...getCorsHeaders() } 
     });
   }
 }
 
+/**
+ * 处理流式响应：过滤内心戏，只留正文
+ */
 function makeStreamResponse(aiStream, model, requestId, createdTime) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
@@ -106,25 +117,35 @@ function makeStreamResponse(aiStream, model, requestId, createdTime) {
         }
 
         const chunk = decoder.decode(value);
-        const lines = chunk.split('\n').filter(l => l.startsWith('data: '));
+        const lines = chunk.split('\n');
         
         for (let line of lines) {
+          if (!line.startsWith('data: ')) continue;
           const jsonStr = line.replace('data: ', '').trim();
           if (jsonStr === '[DONE]') continue;
+
           try {
             const parsed = JSON.parse(jsonStr);
-            const content = extractText(parsed);
-            if (content) {
+            const content = extractText(parsed, true);
+
+            // 关键：只有当内容非空（正式回复开始）时才推送到前端
+            if (content && content !== "undefined") {
               const payload = {
-                id: requestId,
+                id: String(requestId),
                 object: "chat.completion.chunk",
                 created: createdTime,
                 model: model,
-                choices: [{ index: 0, delta: { content: content }, finish_reason: null }]
+                choices: [{
+                  index: 0,
+                  delta: { content: String(content) },
+                  finish_reason: null
+                }]
               };
               await writer.write(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`));
             }
-          } catch (e) {}
+          } catch (e) {
+            // 解析失败通常是数据包断裂，跳过即可
+          }
         }
       }
     } finally {
@@ -133,12 +154,19 @@ function makeStreamResponse(aiStream, model, requestId, createdTime) {
   })();
 
   return new Response(readable, {
-    headers: { "Content-Type": "text/event-stream", ...getCorsHeaders() }
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      ...getCorsHeaders()
+    }
   });
 }
 
 function handleCors() {
-  return new Response(null, { status: 204, headers: getCorsHeaders() });
+  return new Response(null, {
+    status: 204,
+    headers: getCorsHeaders()
+  });
 }
 
 function getCorsHeaders() {
